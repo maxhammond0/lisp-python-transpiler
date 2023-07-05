@@ -5,6 +5,8 @@ module Main where
 import Control.Applicative
 import Control.Arrow
 import Control.Monad
+import Data.Bool
+import Data.List
 import System.Environment
 
 type Name = String
@@ -138,6 +140,62 @@ sepBy sep parser = do
   first <- Main.optional parser
   rest <- Main.many (sep *> parser)
   pure $ maybe rest (:rest) first
+
+parseExpr :: Parser Expr
+parseExpr = fmap ATOM parseAtom <|> fmap LIST parseList
+
+parseList :: Parser [Expr]
+parseList = parens $ sepBy spaces1 parseExpr
+
+parseAtom :: Parser Atom
+parseAtom = parseSymbol <|> parseInt
+
+parseSymbol :: Parser Atom
+parseSymbol = fmap Symbol parseName
+
+parseName :: Parser Name
+parseName = do
+  c <- oneOf ['a' .. 'z']
+  cs <- Main.many $ oneOf $ ['a' .. 'z'] ++ "0123456789" ++ "_"
+  pure (c:cs)
+
+parseInt :: Parser Atom
+parseInt = do
+  sign <- Main.optional $ char '_'
+  num <- many1 $ oneOf "0123456789"
+  let result = read $ maybe num (:num) sign
+  pure $ Int result
+
+runExprParser :: Name -> String -> Either String Expr
+runExprParser name str =
+  case runParser name str (withSpaces parseExpr) of
+    Left (ParseError _ errMsg) -> Left errMsg
+    Right (result, _) -> Right result
+
+printExpr :: Expr -> String
+printExpr = printExpr' False 0
+
+printAtom :: Atom -> String
+printAtom = \case
+  Symbol s -> s
+  Int i -> show i
+
+printExpr' :: Bool -> Int -> Expr -> String
+printExpr' doindent level = \case
+  ATOM a -> indent (bool 0 level doindent) (printAtom a)
+  LIST (e:es) ->
+    indent (bool 0 level doindent) $
+      concat
+        [ "("
+        , printExpr' False (level + 1) e
+        , bool "\n" "" (null es)
+        , intercalate "\n" $ map (printExpr' True (level + 1)) es
+        , ")"
+        ]
+
+indent :: Int -> String -> String
+indent tabs e = concat (replicate tabs "  ") ++ e
+
 
 parseCode src output = undefined
 
