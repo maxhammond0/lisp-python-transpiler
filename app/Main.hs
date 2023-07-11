@@ -196,13 +196,132 @@ printExpr' doindent level = \case
 indent :: Int -> String -> String
 indent tabs e = concat (replicate tabs "  ") ++ e
 
+data PyExpr
+  = PyInt Int
+  | PySymbol Name
+  | PyBinOp PyBinOp PyExpr PyExpr
+  | PyLambda [Name] PyExpr
+  | PyFunCall PyExpr [PyExpr]
+  | PyReturn PyExpr
+  deriving (Show, Eq, Read)
 
-parseCode src output = undefined
+type PyBinOp = String
+
+type Builtin = [Expr] -> Either TransError PyExpr
+type Builtins = [(Name, Builtin)]
+
+builtins :: Builtins
+builtins =
+  [ ("lambda", transLambda)
+  , ("let", transLet)
+  , ("add", transBinOp "add" "+")
+  , ("mul", transBinOp "mul" "*")
+  , ("sub", transBinOp "sub" "-")
+  , ("div", transBinOp "div" "/")
+  , ("print", transPrint)
+  ]
+
+transLambda :: [Expr] -> Either TransError PyExpr
+transLambda = \case
+  [LIST vars, body] -> do
+    vars' <- traverse fromSymbol vars
+    PyLambda vars' <$> (PyReturn <$> translateToPy body)
+
+  vars ->
+    Left $ unlines
+      [ "Syntax error: unexpected arguments for lambda"
+      , "expecting 2 arguments, the first is the list of vars and the second is the body of the lambda"
+      , "in the expression: " ++ show (LIST $ ATOM (Symbol "lambda") : vars)
+      ]
+
+fromSymbol :: Expr -> Either String Name
+fromSymbol (ATOM (Symbol s)) = Right s
+fromSymbol e = Left $ "cannot bind value to non symbol type: " ++ show e
+
+transLet :: [Expr] -> Either TransError PyExpr
+transLet = \case
+  [LIST binds, body] -> do
+    (vars, vals) <- letParams binds
+    vars' <- traverse fromSymbol vars
+    PyFunCall . PyLambda vars' <$> (PyReturn <$> translateToPy body) <*> traverse translateToPy vals
+   where
+    letParams :: [Expr] -> Either Error ([Expr],[Expr])
+    letParams = \case
+      [] -> pure ([],[])
+      LIST [x,y] : rest -> ((x:) *** (y:)) <$> letParams rest
+      x : _ -> Left ("Unexpected argument in let list in expression:\n" ++ printExpr x)
+
+  vars ->
+    Left $ unlines
+      ["Syntax error: unexpected arguments for let."
+      ,"expecting 2 arguments, the first is the list of var/val pairs and the second is the let body."
+      ,"In expression:\n" ++ printExpr (LIST $ ATOM (Symbol "let") : vars)
+      ]
+
+transBinOp :: Name -> Name -> [Expr] -> Either TransError PyExpr
+transBinOp f _ [] = Left $ "SyntaxError: '" ++ f ++ "' expected at least 1 argument, got 0"
+transBinOp _ _ [x] = translateToPy x
+transbinOp _ f list = foldl1 (PyBinOp f) <$> traverse translateToPy list
+
+transPrint :: [Expr] -> Either TransError PyExpr
+transPrint [expr] = PyFunCall (PySymbol "console.log") . (:[]) <$> translateToPy expr
+transPrint xs = Left $ "Syntax error. print expected 1 arguments, got " ++ show (length xs)
+
+printPyOp :: PyBinOp -> String
+printPyOp op = op
+
+printPyExpr :: Bool -> Int -> PyExpr -> String
+printPyExpr doindent tabs = \case
+  PyInt i -> show i
+  PySymbol name -> name
+  PyLambda vars expr -> (if doindent then indent tabs else id) $ unlines
+    ["function(" ++ intercalate ", " vars ++ ")" ++ "{"
+    , indent (tabs + 1) $ printPyExpr False (tabs + 1) expr
+    ] ++ indent tabs "}"
+  PyBinOp op e1 e2 -> "(" ++ printPyExpr False tabs e1 ++ " " ++ printPyOp op ++ " " ++ printPyExpr False tabs e2 ++ ")"
+  PyFunCall f exprs -> "(" ++ printPyExpr False tabs f ++ ")(" ++ intercalate ", " (fmap (printPyExpr False tabs) exprs) ++ ")"
+  PyReturn expr -> (if doindent then indent tabs else id) $ "return " ++ printPyExpr False tabs expr ++ ";"
+
+type TransError = String
+
+translateToPy :: Expr -> Either TransError PyExpr
+translateToPy = \case
+  ATOM (Symbol s) -> pure $ PySymbol s
+  ATOM (Int i) -> pure $ PyInt i
+  LIST xs -> translateList xs
+
+translateList :: [Expr] -> Either TransError PyExpr
+translateList = \case
+  [] -> Left "Translating empty list"
+  ATOM (Symbol s):xs
+    | Just f <- lookup s builtins ->
+      f xs
+  f:xs ->
+    PyFunCall <$> translateToPy f <*> traverse translateToPy xs
 
 main :: IO ()
-main = do
-  args <- getArgs
-  case args of
-    [src, output] -> parseCode src output
-    [src] -> parseCode src "a.py"
-    _ -> putStrLn "Uncorrect usage: ./prog <src> <output>"
+main = getArgs >>= \case
+  [file] ->
+    printCompile =<< readFile file
+  ["--e",file] ->
+    either putStrLn print . runExprParser "--e" =<< readFile file
+  ["--pp",file] ->
+    either putStrLn (putStrLn . printExpr) . runExprParser "--pp" =<< readFile file
+  ["--jye",file] ->
+    either print (either putStrLn print . translateToPy) . runExprParser "--jye" =<< readFile file
+  ["--ppc",file] ->
+    either putStrLn (either putStrLn putStrLn) . fmap (compile . printExpr) . runExprParser "--ppc" =<< readFile file
+  _ ->
+    putStrLn $ unlines
+      ["Usage: runghc Main.hs [ --e, --pp, --jse, --ppc ] <filename>"
+      ,"--e     print the Expr"
+      ,"--pp    prettyprint Expr"
+      ,"--jse   print the PyExpr"
+      ,"--ppc   prettyprint Expr and then compile"
+      ]
+
+printCompile :: String -> IO ()
+printCompile = either putStrLn putStrLn . compile
+
+compile :: String -> Either Error String
+compile str = printPyExpr False 0 <$> (translateToPy =<< runExprParser "compile" str)
